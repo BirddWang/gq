@@ -1,0 +1,58 @@
+name: Bug report
+description: Something in gq behaves incorrectly
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Before filing, please check
+        [docs/troubleshooting.md](https://github.com/BirddWang/gq/blob/main/docs/troubleshooting.md)
+        — GPUs stuck in `EXTERNAL`/`UNKNOWN`, jobs stuck in `WAITING`, and daemon
+        startup failures are covered there.
+
+        **Do not attach `gq.sqlite3`.** It stores the environment of every job.
+        Skim the daemon log before pasting it: it records job commands and paths.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What did you expect, and what happened instead?
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. gq -g 1 ...
+        2. gq ps
+        3. ...
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: gq version
+      description: Output of `gq --version`
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      description: Linux distribution, Python version, NVIDIA driver version, and whether you run in a container
+      placeholder: "Ubuntu 24.04, Python 3.12, driver 560.35, inside Docker"
+    validations:
+      required: true
+  - type: textarea
+    id: state
+    attributes:
+      label: Scheduler state
+      description: Output of `gq gpu` and `gq ps`, plus `gq show JOB` if one job is involved
+      render: text
+  - type: textarea
+    id: daemon-log
+    attributes:
+      label: Daemon log
+      description: Relevant lines from `tail -n 100 ~/.local/share/gq/gq-daemon.log`
+      render: text

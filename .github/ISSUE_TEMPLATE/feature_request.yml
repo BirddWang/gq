@@ -1,0 +1,29 @@
+name: Feature request
+description: Suggest something gq should do
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        `gq` is deliberately small, and some things are permanent non-goals:
+        multi-node scheduling, CPU/RAM allocation, MIG, and fractional GPU sharing.
+        See [CONTRIBUTING.md](https://github.com/BirddWang/gq/blob/main/CONTRIBUTING.md#scope).
+
+        Please open an issue before writing the code, so a rejected PR does not
+        waste your time.
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What are you trying to do that gq makes hard today? Describe the situation, not the solution.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What you have in mind
+      description: If you have a specific interface in mind, sketch it.
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: What you do instead today

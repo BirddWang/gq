@@ -1,0 +1,66 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "gq-local"
+dynamic = ["version"]
+description = "A small, single-user NVIDIA GPU job scheduler for Linux"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Bo-Jyun Wang" }]
+dependencies = ["nvidia-ml-py>=12.560.30"]
+
+[project.urls]
+Homepage = "https://github.com/BirddWang/gq"
+Repository = "https://github.com/BirddWang/gq"
+Issues = "https://github.com/BirddWang/gq/issues"
+Changelog = "https://github.com/BirddWang/gq/blob/main/CHANGELOG.md"
+
+[project.scripts]
+gq = "gq.cli:main"
+
+[dependency-groups]
+dev = [
+  "pytest>=8.3",
+  "pytest-asyncio>=0.24",
+  "ruff>=0.6",
+  "mypy>=1.11",
+]
+
+[tool.hatch.version]
+path = "src/gq/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/gq"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+asyncio_mode = "auto"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "RUF"]
+# JobState/GPUState are persisted to SQLite and JSON as their values. Switching the
+# `str, Enum` mixin to StrEnum would change what str() returns for a member, which is
+# a semantic change for a style rule's sake.
+ignore = ["UP042"]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests reach into private helpers deliberately.
+"tests/*" = ["E501"]
+
+[tool.mypy]
+python_version = "3.11"
+files = ["src/gq"]
+strict = true
+# pynvml ships no type information.
+[[tool.mypy.overrides]]
+module = ["pynvml"]
+ignore_missing_imports = true
+
