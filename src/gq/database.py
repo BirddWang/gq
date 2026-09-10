@@ -138,7 +138,10 @@ class Database:
                     str(log_path),
                 ),
             )
-            job_id = int(cursor.lastrowid)
+            row_id = cursor.lastrowid
+            if row_id is None:  # SQLite always sets this after an INSERT.
+                raise RuntimeError("SQLite reported no row id for the inserted job")
+            job_id = row_id
         job = self.get_job(job_id)
         assert job is not None
         return job

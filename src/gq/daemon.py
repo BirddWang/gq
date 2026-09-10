@@ -208,10 +208,10 @@ class Daemon:
             jobs = await self.scheduler.list_jobs(int(limit) if limit is not None else None)
             return {"ok": True, "jobs": [job.to_dict() for job in jobs]}
         if kind == "show_job":
-            job = await self.scheduler.get_job(int(request["job_id"]))
-            if job is None:
+            shown = await self.scheduler.get_job(int(request["job_id"]))
+            if shown is None:
                 raise SchedulerError(f"job {request['job_id']} does not exist")
-            return {"ok": True, "job": job.to_dict()}
+            return {"ok": True, "job": shown.to_dict()}
         if kind == "gpu_status":
             statuses = await self.scheduler.gpu_status()
             return {"ok": True, "gpus": [status.to_dict() for status in statuses]}

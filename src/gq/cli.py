@@ -272,7 +272,7 @@ def _print_gpus(as_json: bool = False) -> None:
 
 def _show(job_id: int, as_json: bool = False) -> dict[str, Any]:
     response = _daemon_request({"type": "show_job", "job_id": job_id})
-    job = response["job"]
+    job: dict[str, Any] = response["job"]
     if as_json:
         print(json.dumps(job, indent=2))
         return job
