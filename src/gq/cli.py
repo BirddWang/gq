@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from . import __version__
+from . import update as updater
 from .models import JobState
 from .paths import Paths
 from .protocol import PROTOCOL_VERSION, ProtocolError, request
@@ -233,6 +234,8 @@ def _print_jobs(limit: int | None, as_json: bool = False) -> None:
             )
         )
     print(_table(["JOB", "STATE", "GPUs", "PID", "NAME", "COMMAND"], rows))
+    if response.get("queue_paused"):
+        print("gq: the queue is paused; resume it with 'gq daemon resume'", file=sys.stderr)
 
 
 def _mib(value: int | None) -> str:
@@ -381,6 +384,180 @@ def _clean_jobs(older_than: str, states: list[str] | None, assume_yes: bool) -> 
     print(f"Removed {len(removed)} job(s) and their logs.")
 
 
+ACTIVE_STATES = {JobState.STARTING.value, JobState.RUNNING.value, JobState.CANCELLING.value}
+
+
+def _active_job_ids() -> list[int]:
+    response = _daemon_request({"type": "list_jobs"}, auto_start=False)
+    return [job["id"] for job in response["jobs"] if job["state"] in ACTIVE_STATES]
+
+
+def _pause_queue() -> list[int] | None:
+    """Pause the queue and return the jobs still running.
+
+    Returns None when the daemon predates pausing. Pausing before looking at running
+    jobs matters: otherwise a queued job can start between the check and the daemon
+    stopping, and would then be recorded as FAILED by the restarted daemon.
+    """
+    try:
+        response = _daemon_request({"type": "pause_queue"}, auto_start=False)
+    except CLIError as exc:
+        if "unknown request type" in str(exc):
+            return None
+        raise
+    return [int(job_id) for job_id in response["active_job_ids"]]
+
+
+def _resume_queue() -> None:
+    _daemon_request({"type": "resume_queue"}, auto_start=False)
+
+
+def _wait_for_running_jobs(active: list[int]) -> bool:
+    """Wait, with the queue already paused, until no managed job is running.
+
+    Returns False if the user interrupted, in which case the queue is resumed.
+    """
+    # Flushed explicitly: --wait can run for hours, often with output redirected.
+    print("Queue paused: running jobs will finish, queued jobs will wait.", flush=True)
+    print(
+        "Waiting for running jobs to finish (Ctrl-C to cancel and resume the queue)...",
+        flush=True,
+    )
+    reported: list[int] = []
+    try:
+        while active:
+            if active != reported:
+                print(f"  still running: {', '.join(map(str, active))}", flush=True)
+                reported = active
+            time.sleep(5)
+            active = _active_job_ids()
+    except KeyboardInterrupt:
+        _resume_queue()
+        print("\nUpdate cancelled; the queue is running again.")
+        return False
+    return True
+
+
+def _installed_version() -> str | None:
+    """Ask a fresh interpreter, since this process still has the old code loaded."""
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c", "import gq; print(gq.__version__)"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    return result.stdout.strip() or None
+
+
+def _jobs_are_running(job_ids: list[int]) -> str:
+    listed = ", ".join(map(str, job_ids))
+    return f"job {listed} is running" if len(job_ids) == 1 else f"jobs {listed} are running"
+
+
+def _prepare_daemon_for_update(paths: Paths, *, wait: bool, force: bool) -> bool:
+    """Get the daemon out of the way. Returns False if the user cancelled."""
+    active = _pause_queue()
+    can_pause = active is not None
+    if active is None:
+        active = _active_job_ids()
+    try:
+        if active and force:
+            print(
+                f"warning: updating while {_jobs_are_running(active)}; they will be "
+                "recorded as FAILED when they finish",
+                file=sys.stderr,
+            )
+        elif active and wait:
+            if not can_pause:
+                raise CLIError(
+                    "the running daemon predates queue pausing, so --wait cannot stop a "
+                    "queued job from starting mid-update. Wait until 'gq ps' shows nothing "
+                    "running, or use --force."
+                )
+            if not _wait_for_running_jobs(active):
+                return False
+        elif active:
+            raise CLIError(
+                f"{_jobs_are_running(active).capitalize()}. Updating restarts the daemon, "
+                "and a restarted daemon cannot collect the exit status of jobs it did not "
+                "start, so they would be recorded as FAILED when they finish.\n"
+                "    gq update --wait    pause the queue, let running jobs finish, then update\n"
+                "    gq update --force   update now anyway"
+            )
+        _stop_daemon(paths)
+    except CLIError:
+        # Never leave a live daemon paused because the update did not go ahead.
+        if can_pause and _ping(paths) is not None:
+            _resume_queue()
+        raise
+    return True
+
+
+def _update(check_only: bool, wait: bool, force: bool) -> int:
+    installation = updater.detect_installation()
+    try:
+        latest = updater.latest_release()
+    except updater.UpdateError as exc:
+        raise CLIError(str(exc)) from exc
+    print(f"Installed: gq {__version__} ({installation.description})")
+    print(f"Latest:    gq {latest}")
+    if not updater.is_newer(latest, __version__):
+        print("gq is up to date.")
+        return 0
+    if check_only:
+        print("An update is available; run 'gq update' to install it.")
+        return 0
+    if installation.command is None:
+        raise CLIError(f"gq cannot update this installation itself: {installation.advice}")
+
+    paths = Paths.from_environment()
+    daemon_was_running = _ping(paths) is not None
+    if daemon_was_running and not _prepare_daemon_for_update(paths, wait=wait, force=force):
+        return 130
+
+    print(f"Running: {shlex.join(installation.command)}", flush=True)
+    restarted: dict[str, Any] | None = None
+    try:
+        result = subprocess.run(installation.command)
+    except KeyboardInterrupt:
+        print("\nInstaller interrupted.", file=sys.stderr)
+        return 130
+    finally:
+        # Restart even if the installer failed or was interrupted: the queue should
+        # keep moving on whichever version is now installed.
+        if daemon_was_running:
+            restarted = _start_daemon(paths, quiet=True)
+
+    now = _installed_version()
+    if result.returncode != 0:
+        raise CLIError(
+            f"the installer exited with status {result.returncode}; gq {now or 'unknown'} "
+            "is still installed"
+        )
+    if now == __version__:
+        print(
+            f"warning: the installer succeeded but gq is still {__version__}; a version "
+            "constraint may be pinning it",
+            file=sys.stderr,
+        )
+    else:
+        print(f"Updated gq {__version__} -> {now or 'unknown'}.")
+    if restarted is not None:
+        print(f"Daemon restarted (pid {restarted['pid']}, version {restarted['version']}).")
+        if now is not None and restarted["version"] != now:
+            print(
+                f"warning: the daemon is running gq {restarted['version']}, not {now}; "
+                "run 'gq daemon stop' and let the next command start it",
+                file=sys.stderr,
+            )
+    return 0
+
+
 def _add_env_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--env-all",
@@ -457,8 +634,28 @@ def _main_parser() -> argparse.ArgumentParser:
     cancel = sub.add_parser("cancel", help="cancel a job")
     cancel.add_argument("job_id", type=int)
 
+    update = sub.add_parser("update", help="upgrade gq to the latest release")
+    update.add_argument(
+        "--check", action="store_true", help="only report whether an update is available"
+    )
+    when = update.add_mutually_exclusive_group()
+    when.add_argument(
+        "--wait",
+        action="store_true",
+        help="pause the queue and let running jobs finish before updating",
+    )
+    when.add_argument(
+        "--force",
+        action="store_true",
+        help="update while jobs run; they are recorded as FAILED when they finish",
+    )
+
     daemon = sub.add_parser("daemon", help="manage the scheduler daemon")
-    daemon.add_argument("action", choices=("start", "stop", "status"))
+    daemon.add_argument(
+        "action",
+        choices=("start", "stop", "status", "pause", "resume"),
+        help="pause stops queued jobs from starting; running jobs are unaffected",
+    )
     return parser
 
 
@@ -516,18 +713,32 @@ def main(argv: list[str] | None = None) -> int:
         elif args.subcommand == "cancel":
             response = _daemon_request({"type": "cancel_job", "job_id": args.job_id})
             print(f"Job {args.job_id}: {response['message']}")
+        elif args.subcommand == "update":
+            return _update(args.check, args.wait, args.force)
         elif args.subcommand == "daemon":
             paths = Paths.from_environment()
             if args.action == "start":
                 _start_daemon(paths)
             elif args.action == "stop":
                 _stop_daemon(paths)
+            elif args.action == "pause":
+                response = _daemon_request({"type": "pause_queue"})
+                active = response["active_job_ids"]
+                print(
+                    "Queue paused; queued jobs will not start until 'gq daemon resume'. "
+                    + (f"Still running: {', '.join(map(str, active))}." if active else "")
+                )
+            elif args.action == "resume":
+                _daemon_request({"type": "resume_queue"})
+                print("Queue resumed.")
             else:
                 running = _ping(paths)
                 if running:
                     print(
                         f"gq daemon is running (pid {running['pid']}, version {running['version']})"
                     )
+                    if running.get("queue_paused"):
+                        print("the queue is paused; resume it with 'gq daemon resume'")
                     spoken = running.get("protocol")
                     if spoken != PROTOCOL_VERSION:
                         print(

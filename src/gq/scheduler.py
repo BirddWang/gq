@@ -49,6 +49,25 @@ class Scheduler:
         self._monitor_tasks: dict[int, asyncio.Task[None]] = {}
         self._cancellation_tasks: dict[int, asyncio.Task[None]] = {}
         self._stopping = False
+        # In memory only, deliberately: a daemon restart always resumes the queue,
+        # which is what an update that paused it wants.
+        self._paused = False
+
+    @property
+    def paused(self) -> bool:
+        return self._paused
+
+    async def set_paused(self, paused: bool) -> None:
+        """Stop or restart launching queued jobs. Running jobs are never affected."""
+        async with self.lock:
+            if paused == self._paused:
+                return
+            self._paused = paused
+            if paused:
+                self.log.info("queue paused: running jobs continue, queued jobs will wait")
+            else:
+                self.log.info("queue resumed")
+                await self._try_schedule_locked()
 
     async def initialize(self) -> None:
         async with self.lock:
@@ -107,6 +126,10 @@ class Scheduler:
             self._refresh_observations_locked()
             await self._reap_recovered_jobs_locked()
             await self._try_schedule_locked()
+
+    async def active_jobs(self) -> list[Job]:
+        async with self.lock:
+            return self.db.active_jobs()
 
     async def list_jobs(self, limit: int | None = None) -> list[Job]:
         async with self.lock:
@@ -232,7 +255,7 @@ class Scheduler:
         )
 
     async def _try_schedule_locked(self) -> None:
-        if self._stopping:
+        if self._stopping or self._paused:
             return
         statuses = self._gpu_status_locked()
         for waiting in self.db.waiting_jobs():

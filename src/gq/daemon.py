@@ -185,6 +185,7 @@ class Daemon:
                 "pid": os.getpid(),
                 "version": __version__,
                 "protocol": PROTOCOL_VERSION,
+                "queue_paused": self.scheduler.paused,
             }
         if kind == "submit":
             argv = request["argv"]
@@ -206,7 +207,11 @@ class Daemon:
         if kind == "list_jobs":
             limit = request.get("limit")
             jobs = await self.scheduler.list_jobs(int(limit) if limit is not None else None)
-            return {"ok": True, "jobs": [job.to_dict() for job in jobs]}
+            return {
+                "ok": True,
+                "jobs": [job.to_dict() for job in jobs],
+                "queue_paused": self.scheduler.paused,
+            }
         if kind == "show_job":
             shown = await self.scheduler.get_job(int(request["job_id"]))
             if shown is None:
@@ -236,6 +241,13 @@ class Daemon:
                     raise ValueError(f"unknown job state: {exc}") from exc
             removed = await self.scheduler.clean_jobs(str(request["cutoff"]), states)
             return {"ok": True, "removed": [job.id for job in removed]}
+        if kind == "pause_queue":
+            await self.scheduler.set_paused(True)
+            active = await self.scheduler.active_jobs()
+            return {"ok": True, "active_job_ids": [job.id for job in active]}
+        if kind == "resume_queue":
+            await self.scheduler.set_paused(False)
+            return {"ok": True}
         if kind == "shutdown":
             self.stop_event.set()
             return {"ok": True, "message": "daemon stopping; running jobs are unchanged"}

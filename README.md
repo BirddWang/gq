@@ -100,6 +100,8 @@ Day to day:
 | `gq rm JOB...` | delete terminal jobs and their logs |
 | `gq clean --older-than 30d` | sweep old terminal jobs and their logs |
 | `gq daemon start\|stop\|status` | manage the daemon |
+| `gq daemon pause\|resume` | stop or restart launching queued jobs |
+| `gq update [--check] [--wait]` | upgrade to the latest release and restart the daemon |
 
 `--json` is the supported scripting interface; table layouts may change between
 releases.

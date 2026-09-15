@@ -64,6 +64,13 @@ Consequences worth planning around:
 - `gq rm` and `gq clean` delete the rows, but SQLite may retain freed pages. Use
   `VACUUM` if you need the bytes gone.
 
+## Network access
+
+`gq` makes no network connections, with one exception: `gq update` fetches
+`https://pypi.org/pypi/gq-local/json` over HTTPS to learn the latest version, then
+runs your existing package manager (`uv`, `pipx`, or `pip`), which downloads from
+whatever index that tool is configured to use. The daemon never touches the network.
+
 ## Cancellation and process identity
 
 Cancellation signals a saved process group, never a bare PID. Before signalling,

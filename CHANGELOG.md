@@ -3,6 +3,24 @@
 All notable changes to this project are documented here. This project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] - 2026-09-15
+
+### Added
+
+- **`gq update`** upgrades gq in place. It detects whether gq came from `uv tool`,
+  `pipx`, or `pip`, runs the matching upgrade, and restarts the daemon on the new
+  version. Installs from a source checkout, git URL, or editable mode are never
+  switched to PyPI silently; `gq update` prints the command to run instead.
+  `--check` only reports whether a release is available.
+- Because a restarted daemon cannot collect exit status from jobs it did not start,
+  `gq update` **refuses while jobs are running**. `--wait` pauses the queue and lets
+  them finish first; `--force` proceeds anyway.
+- **`gq daemon pause` and `gq daemon resume`** stop and restart the launching of
+  queued jobs without affecting running ones. `gq ps` and `gq daemon status` report a
+  paused queue.
+- Trove classifiers for Python 3.11–3.13, so PyPI and its badges show supported
+  versions.
+
 ## [0.1.1] - 2026-09-10
 
 A hardening release. No new scheduling behavior; everything here came from defects

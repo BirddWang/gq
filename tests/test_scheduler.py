@@ -207,3 +207,39 @@ async def test_cleanup_never_unlinks_outside_the_log_directory(tmp_path: Path) -
 
     assert bystander.read_text() == "do not delete me"
     await scheduler.close()
+
+
+@pytest.mark.asyncio
+async def test_paused_queue_accepts_jobs_but_does_not_start_them(tmp_path: Path) -> None:
+    provider = FakeGPUProvider([GPUObservation("A", 0, "GPU")])
+    scheduler = make_scheduler(tmp_path, provider)
+    await scheduler.initialize()
+    await scheduler.set_paused(True)
+
+    job = await scheduler.submit(["true"], tmp_path, {}, 1)
+    await scheduler.tick()
+    current = await scheduler.get_job(job.id)
+    assert current is not None and current.state is JobState.WAITING
+
+    await scheduler.set_paused(False)
+    await wait_for_state(scheduler, job.id, {JobState.DONE})
+    await scheduler.close()
+
+
+@pytest.mark.asyncio
+async def test_pausing_does_not_touch_running_jobs(tmp_path: Path) -> None:
+    provider = FakeGPUProvider([GPUObservation("A", 0, "GPU")])
+    scheduler = make_scheduler(tmp_path, provider)
+    await scheduler.initialize()
+    running = await scheduler.submit(["sleep", "0.5"], tmp_path, {}, 1)
+    await wait_for_state(scheduler, running.id, {JobState.RUNNING})
+    queued = await scheduler.submit(["true"], tmp_path, {}, 1)
+
+    await scheduler.set_paused(True)
+    assert [job.id for job in await scheduler.active_jobs()] == [running.id]
+    # The running job still finishes normally, and its freed GPU is not handed on.
+    await wait_for_state(scheduler, running.id, {JobState.DONE})
+    await scheduler.tick()
+    current = await scheduler.get_job(queued.id)
+    assert current is not None and current.state is JobState.WAITING
+    await scheduler.close()

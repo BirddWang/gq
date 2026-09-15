@@ -196,6 +196,49 @@ hand-edited `log_path` cannot turn cleanup into arbitrary file deletion.
 
 Neither command is reversible. Back up `gq.sqlite3` first if the history matters.
 
+## Pausing the queue
+
+```bash
+gq daemon pause    # queued jobs stay WAITING; running jobs are untouched
+gq daemon resume
+```
+
+Pausing is useful before maintenance: submissions are still accepted, but nothing
+new starts, so the set of running jobs can only shrink. `gq ps` and `gq daemon
+status` say when the queue is paused. The pause lives only in the daemon's memory,
+so restarting the daemon always resumes the queue.
+
+## Updating gq
+
+```bash
+gq update --check   # is there a newer release on PyPI?
+gq update           # install it and restart the daemon
+gq update --wait    # first let running jobs finish
+```
+
+`gq update` works out how it was installed and runs the matching upgrade:
+`uv tool upgrade` for a uv tool, `pipx upgrade` for pipx, or the environment's own
+`pip` (or `uv pip` in a virtualenv created without pip). If gq was installed from a
+source checkout, a git URL, or in editable mode, it does not switch you to PyPI
+behind your back; it prints the command to run instead. This is the only command in
+`gq` that contacts the network, and only `pypi.org`.
+
+Updating restarts the daemon, and **running jobs are the one thing to be careful
+about**. A restarted daemon reattaches to running jobs, but Linux does not let it
+collect the exit status of a process an earlier daemon started, so those jobs are
+recorded as `FAILED` ("exit status unavailable") when they finish, even if they
+succeeded. So:
+
+- with nothing running, `gq update` pauses the queue, stops the daemon, upgrades, and
+  starts the new daemon, which resumes the queue;
+- with jobs running, it refuses and lists them;
+- `--wait` pauses the queue and waits for running jobs to finish first, while queued
+  jobs stay safely `WAITING`. Ctrl-C cancels the update and resumes the queue;
+- `--force` updates immediately and accepts the mislabeled results.
+
+Queued jobs are never at risk: they are stored in SQLite and start under the new
+daemon. If the daemon was not running before the update, it is not started.
+
 ## Restart behavior
 
 Queued jobs resume normally because argv, directory, and environment are in
