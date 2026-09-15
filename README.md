@@ -96,7 +96,9 @@ Day to day:
 | `gq gpu [--json]` | physical and logical GPU state |
 | `gq show JOB [--json]` | everything about one job |
 | `gq logs [-f] JOB` | read or follow a job's output |
-| `gq cancel JOB` | `SIGTERM` the process group, then `SIGKILL` after a grace period |
+| `gq cancel JOB...` | cancel jobs; takes ranges (`300-440`), `--group`, `--waiting` |
+| `gq retry JOB...` | resubmit failed or cancelled jobs; `--group NAME --failed` |
+| `gq groups` | every group with its progress, and whether it is held |
 | `gq rm JOB...` | delete terminal jobs and their logs |
 | `gq clean --older-than 30d` | sweep old terminal jobs and their logs |
 | `gq daemon start\|stop\|status` | manage the daemon |
@@ -105,6 +107,27 @@ Day to day:
 
 `--json` is the supported scripting interface; table layouts may change between
 releases.
+
+## Running a sweep
+
+Give the batch a group and each cell a key, and the script becomes safe to re-run:
+
+```bash
+export GQ_GROUP=xsum-ablation
+for SEED in 1 2 3; do
+  for CELL in kl kl-enc_hddn kl-enc_self; do
+    gq -g 1 --key "xsum/$CELL/seed$SEED" uv run trainer.py --losses ... --seed "$SEED"
+  done
+done
+```
+
+- Re-running it submits only cells that are missing, failed, or cancelled.
+- `gq groups` shows the sweep's progress; `gq cancel --group xsum-ablation` stops it.
+- If the batch is broken, gq **holds the group** after 3 jobs in a row fail within a
+  minute, instead of letting every cell fail the same way. Fix it, then
+  `gq retry --group xsum-ablation --failed`.
+
+See [Sweeps](docs/usage.md#sweeps-groups-keys-and-retries) for the details.
 
 ## A note on secrets
 

@@ -1,16 +1,40 @@
 from __future__ import annotations
 
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
 
-from gq.cli import CLIError, _filter_env, _parse_duration, _script_directives
+from gq.cli import (
+    CLIError,
+    ScriptDirectives,
+    _filter_env,
+    _parse_duration,
+    _parse_selectors,
+    _script_directives,
+)
 
 
 def test_script_directives(tmp_path: Path) -> None:
     script = tmp_path / "train.sh"
     script.write_text("#!/bin/bash\n#gq --gpus=2\n#gq --name=training run\necho ok\n")
-    assert _script_directives(script) == (2, "training run")
+    assert _script_directives(script) == ScriptDirectives(gpus=2, name="training run")
+
+
+def test_group_and_key_directives(tmp_path: Path) -> None:
+    script = tmp_path / "cell.sh"
+    script.write_text("#gq --group=xsum-ablation\n#gq --key=xsum/kl/seed1\nrun\n")
+    assert _script_directives(script) == ScriptDirectives(
+        group="xsum-ablation", key="xsum/kl/seed1"
+    )
+
+
+def test_empty_key_directive_is_rejected(tmp_path: Path) -> None:
+    script = tmp_path / "cell.sh"
+    script.write_text("#gq --key=\n")
+    with pytest.raises(CLIError, match="empty key"):
+        _script_directives(script)
 
 
 def test_unknown_script_directive_is_rejected(tmp_path: Path) -> None:
@@ -69,3 +93,39 @@ def test_parse_duration(text: str, seconds: int) -> None:
 def test_parse_duration_rejects_malformed_input(text: str) -> None:
     with pytest.raises(CLIError, match="invalid duration"):
         _parse_duration(text)
+
+
+@pytest.mark.parametrize(
+    ("tokens", "expected"),
+    [
+        (["12"], [(12, 12)]),
+        (["300-440"], [(300, 440)]),
+        (["1", "5-7", "9"], [(1, 1), (5, 7), (9, 9)]),
+    ],
+)
+def test_parse_selectors(tokens: list[str], expected: list[tuple[int, int]]) -> None:
+    assert _parse_selectors(tokens) == expected
+
+
+@pytest.mark.parametrize("token", ["", "abc", "12-", "-5", "10-5", "1.5", "1,2"])
+def test_parse_selectors_rejects_malformed_input(token: str) -> None:
+    with pytest.raises(CLIError):
+        _parse_selectors([token])
+
+
+def test_closed_stdout_exits_quietly() -> None:
+    """`gq ps | head` must not print a BrokenPipeError when head stops reading."""
+    code = (
+        "from gq import cli\n"
+        "cli._print_groups = lambda as_json: [print('x' * 80) for _ in range(50000)]\n"
+        "raise SystemExit(cli.main(['groups']))\n"
+    )
+    process = subprocess.Popen(
+        [sys.executable, "-c", code], stdout=subprocess.PIPE, stderr=subprocess.PIPE
+    )
+    assert process.stdout is not None and process.stderr is not None
+    process.stdout.read(100)
+    process.stdout.close()
+    errors = process.stderr.read()
+    assert process.wait(timeout=30) == 141
+    assert b"BrokenPipe" not in errors and b"Exception ignored" not in errors

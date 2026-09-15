@@ -14,7 +14,7 @@ def utc_now() -> str:
     return datetime.now(UTC).isoformat()
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 BASELINE = [
     """CREATE TABLE IF NOT EXISTS jobs (
@@ -52,11 +52,40 @@ BASELINE = [
 # Ordered upgrades keyed by the version they produce. Each list is applied in one
 # transaction together with its `PRAGMA user_version` bump, so a partially applied
 # migration cannot survive a crash.
-MIGRATIONS: dict[int, list[str]] = {}
+MIGRATIONS: dict[int, list[str]] = {
+    2: [
+        "ALTER TABLE jobs ADD COLUMN group_name TEXT",
+        "ALTER TABLE jobs ADD COLUMN job_key TEXT",
+        # Deliberately not a foreign key: deleting an old attempt with `gq rm` must not
+        # be blocked by the attempts that retried it.
+        "ALTER TABLE jobs ADD COLUMN retry_of INTEGER",
+        "CREATE INDEX jobs_group_idx ON jobs(group_name, id)",
+        "CREATE INDEX jobs_key_idx ON jobs(job_key)",
+        "CREATE INDEX jobs_retry_idx ON jobs(retry_of)",
+        """CREATE TABLE group_holds (
+    group_name TEXT PRIMARY KEY,
+    held INTEGER NOT NULL,
+    reason TEXT,
+    changed_at TEXT NOT NULL
+)""",
+    ],
+}
+
+# A key is taken while any job holding it could still succeed or already has. Only a
+# failed or cancelled attempt frees it for another.
+KEY_RELEASING_STATES = (JobState.FAILED.value, JobState.CANCELLED.value)
 
 
 class SchemaTooNew(RuntimeError):
     pass
+
+
+class KeyInUse(RuntimeError):
+    def __init__(self, key: str, job_id: int, state: JobState) -> None:
+        super().__init__(f"key {key!r} is already {state.value} as job {job_id}")
+        self.key = key
+        self.job_id = job_id
+        self.state = state
 
 
 class Database:
@@ -119,14 +148,29 @@ class Database:
         requested_gpus: int,
         name: str | None,
         log_path: Path,
+        *,
+        group: str | None = None,
+        key: str | None = None,
+        retry_of: int | None = None,
     ) -> Job:
         submitted = utc_now()
         with self.transaction() as conn:
+            if key is not None:
+                # Checked inside the insert's transaction, so two submissions of the
+                # same key cannot both see it as free.
+                holder = conn.execute(
+                    f"""SELECT id, state FROM jobs WHERE job_key = ?
+                        AND state NOT IN ({",".join("?" for _ in KEY_RELEASING_STATES)})
+                        ORDER BY id DESC LIMIT 1""",
+                    (key, *KEY_RELEASING_STATES),
+                ).fetchone()
+                if holder is not None:
+                    raise KeyInUse(key, int(holder["id"]), JobState(holder["state"]))
             cursor = conn.execute(
                 """INSERT INTO jobs
                    (name, state, command_json, cwd, env_json, requested_gpus,
-                    submit_time, log_path)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    submit_time, log_path, group_name, job_key, retry_of)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     name,
                     JobState.WAITING.value,
@@ -136,6 +180,9 @@ class Database:
                     requested_gpus,
                     submitted,
                     str(log_path),
+                    group,
+                    key,
+                    retry_of,
                 ),
             )
             row_id = cursor.lastrowid
@@ -155,12 +202,34 @@ class Database:
         row = self.connection.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
         return self._row_to_job(row) if row else None
 
-    def list_jobs(self, limit: int | None = None) -> list[Job]:
-        sql = "SELECT * FROM jobs ORDER BY id DESC"
-        params: tuple[int, ...] = ()
+    def list_jobs(
+        self,
+        limit: int | None = None,
+        *,
+        group: str | None = None,
+        states: Sequence[JobState] | None = None,
+        id_ranges: Sequence[tuple[int, int]] | None = None,
+    ) -> list[Job]:
+        """Newest first. Filters combine with AND; ranges are inclusive and combine with OR."""
+        clauses: list[str] = []
+        params: list[object] = []
+        if group is not None:
+            clauses.append("group_name = ?")
+            params.append(group)
+        if states:
+            clauses.append(f"state IN ({','.join('?' for _ in states)})")
+            params.extend(state.value for state in states)
+        if id_ranges:
+            clauses.append("(" + " OR ".join("id BETWEEN ? AND ?" for _ in id_ranges) + ")")
+            for low, high in id_ranges:
+                params.extend((low, high))
+        sql = "SELECT * FROM jobs"
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        sql += " ORDER BY id DESC"
         if limit is not None:
             sql += " LIMIT ?"
-            params = (limit,)
+            params.append(limit)
         return [self._row_to_job(row) for row in self.connection.execute(sql, params)]
 
     def waiting_jobs(self) -> list[Job]:
@@ -295,6 +364,85 @@ class Database:
                 removed.append(job)
         return removed
 
+    def newer_attempt(self, root: int, after: int) -> int | None:
+        """The id of an attempt in `root`'s retry lineage submitted after job `after`."""
+        row = self.connection.execute(
+            "SELECT id FROM jobs WHERE (id = ? OR retry_of = ?) AND id > ? ORDER BY id LIMIT 1",
+            (root, root, after),
+        ).fetchone()
+        return int(row["id"]) if row else None
+
+    # A job is superseded once a later attempt in its retry lineage exists.
+    _SUPERSEDED = """EXISTS (SELECT 1 FROM jobs later
+                             WHERE later.retry_of = COALESCE(jobs.retry_of, jobs.id)
+                             AND later.id > jobs.id)"""
+
+    def group_counts(self) -> dict[str, dict[str, int]]:
+        """Per-group state counts over each lineage's latest attempt only.
+
+        A cell that failed once and then succeeded on retry counts as DONE, not as one
+        DONE and one FAILED, which would misreport how much of a sweep is broken.
+        """
+        counts: dict[str, dict[str, int]] = {}
+        rows = self.connection.execute(
+            f"""SELECT group_name, state, COUNT(*) AS n FROM jobs
+                WHERE group_name IS NOT NULL AND NOT {self._SUPERSEDED}
+                GROUP BY group_name, state"""
+        )
+        for row in rows:
+            counts.setdefault(str(row["group_name"]), {})[str(row["state"])] = int(row["n"])
+        return counts
+
+    def group_retried_counts(self) -> dict[str, int]:
+        rows = self.connection.execute(
+            f"""SELECT group_name, COUNT(*) AS n FROM jobs
+                WHERE group_name IS NOT NULL AND {self._SUPERSEDED} GROUP BY group_name"""
+        )
+        return {str(row["group_name"]): int(row["n"]) for row in rows}
+
+    def held_groups(self) -> dict[str, str]:
+        rows = self.connection.execute("SELECT group_name, reason FROM group_holds WHERE held = 1")
+        return {str(row["group_name"]): str(row["reason"] or "") for row in rows}
+
+    def set_group_hold(self, group: str, held: bool, reason: str | None = None) -> bool:
+        """Hold or release a group. Returns False if it was already in that state."""
+        with self.transaction() as conn:
+            row = conn.execute(
+                "SELECT held FROM group_holds WHERE group_name = ?", (group,)
+            ).fetchone()
+            if row is not None and bool(row["held"]) == held:
+                return False
+            if row is None and not held:
+                return False
+            conn.execute(
+                """INSERT INTO group_holds (group_name, held, reason, changed_at)
+                   VALUES (?, ?, ?, ?)
+                   ON CONFLICT(group_name) DO UPDATE SET
+                     held = excluded.held, reason = excluded.reason,
+                     changed_at = excluded.changed_at""",
+                (group, int(held), reason, utc_now()),
+            )
+        return True
+
+    def group_released_at(self, group: str) -> str | None:
+        row = self.connection.execute(
+            "SELECT changed_at FROM group_holds WHERE group_name = ? AND held = 0", (group,)
+        ).fetchone()
+        return str(row["changed_at"]) if row else None
+
+    def recent_group_outcomes(self, group: str, since: str | None, limit: int) -> list[Job]:
+        """The group's most recent DONE or FAILED jobs, newest first.
+
+        Cancelled jobs are skipped: cancelling says nothing about whether the batch works.
+        """
+        rows = self.connection.execute(
+            """SELECT * FROM jobs WHERE group_name = ? AND state IN (?, ?)
+               AND end_time IS NOT NULL AND (? IS NULL OR end_time > ?)
+               ORDER BY end_time DESC, id DESC LIMIT ?""",
+            (group, JobState.DONE.value, JobState.FAILED.value, since, since, limit),
+        )
+        return [self._row_to_job(row) for row in rows]
+
     def _row_to_job(self, row: sqlite3.Row) -> Job:
         gpu_rows = self.connection.execute(
             "SELECT gpu_uuid, gpu_index_at_start FROM job_gpus WHERE job_id = ?"
@@ -321,4 +469,7 @@ class Database:
             failure_reason=row["failure_reason"],
             gpu_uuids=[str(g["gpu_uuid"]) for g in gpu_rows],
             gpu_indices=[int(g["gpu_index_at_start"]) for g in gpu_rows],
+            group=row["group_name"],
+            key=row["job_key"],
+            retry_of=row["retry_of"],
         )

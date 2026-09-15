@@ -5,11 +5,12 @@ import contextlib
 import logging
 import os
 import signal
+from datetime import datetime
 from pathlib import Path
 
 from .allocator import classify_gpus, select_gpus
-from .database import Database
-from .models import GPUObservation, GPUState, GPUStatus, Job, JobState
+from .database import Database, KeyInUse
+from .models import MANUAL_HOLD_REASON, GPUObservation, GPUState, GPUStatus, Job, JobState
 from .nvml import GPUProvider
 from .processes import (
     boot_id,
@@ -25,6 +26,39 @@ class SchedulerError(RuntimeError):
     pass
 
 
+class DuplicateKey(SchedulerError):
+    """A submission was skipped because its key is held by a live or successful job."""
+
+    def __init__(self, existing: Job) -> None:
+        state = existing.state.value
+        super().__init__(f"key {existing.key!r} is already {state} as job {existing.id}")
+        self.existing = existing
+
+
+MAX_LABEL_LENGTH = 200
+
+
+def _validate_label(value: str | None, what: str) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise SchedulerError(f"{what} must be a non-empty string")
+    if len(value) > MAX_LABEL_LENGTH:
+        raise SchedulerError(f"{what} must be at most {MAX_LABEL_LENGTH} characters")
+    if any(ord(ch) < 32 or ord(ch) == 127 for ch in value):
+        raise SchedulerError(f"{what} must not contain control characters")
+    return value
+
+
+def _runtime(job: Job) -> float:
+    """Seconds from reservation to finish; infinite when either end is unknown."""
+    if job.start_time is None or job.end_time is None:
+        return float("inf")
+    return (
+        datetime.fromisoformat(job.end_time) - datetime.fromisoformat(job.start_time)
+    ).total_seconds()
+
+
 class Scheduler:
     """The daemon's sole mutation context for jobs and GPU allocations."""
 
@@ -35,9 +69,15 @@ class Scheduler:
         logs_dir: Path,
         *,
         cancel_grace_seconds: float = 10.0,
+        fail_fast_count: int = 3,
+        fail_fast_seconds: float = 60.0,
         logger: logging.Logger | None = None,
     ) -> None:
         self.db = database
+        # A group is held once this many of its jobs in a row fail within
+        # fail_fast_seconds of starting. Zero disables holding.
+        self.fail_fast_count = fail_fast_count
+        self.fail_fast_seconds = fail_fast_seconds
         self.gpu_provider = gpu_provider
         self.logs_dir = logs_dir
         self.cancel_grace_seconds = cancel_grace_seconds
@@ -52,6 +92,9 @@ class Scheduler:
         # In memory only, deliberately: a daemon restart always resumes the queue,
         # which is what an update that paused it wants.
         self._paused = False
+        # Mirrors the group_holds table. This daemon is its only writer, and the
+        # scheduling loop consults it before every launch.
+        self._held: dict[str, str] = {}
 
     @property
     def paused(self) -> bool:
@@ -71,6 +114,7 @@ class Scheduler:
 
     async def initialize(self) -> None:
         async with self.lock:
+            self._held = self.db.held_groups()
             self._refresh_observations_locked()
             await self._recover_locked()
             await self._try_schedule_locked()
@@ -82,7 +126,12 @@ class Scheduler:
         env: dict[str, str],
         requested_gpus: int,
         name: str | None = None,
+        *,
+        group: str | None = None,
+        key: str | None = None,
     ) -> Job:
+        group = _validate_label(group, "group")
+        key = _validate_label(key, "key")
         if not argv or not argv[0]:
             raise SchedulerError("command must not be empty")
         if requested_gpus < 1:
@@ -104,17 +153,15 @@ class Scheduler:
                     f"requested {requested_gpus} GPUs, but this machine has "
                     f"{gpu_count} visible GPUs"
                 )
-            placeholder = self.logs_dir / "pending.log"
-            job = self.db.create_job(
+            job = self._create_locked(
                 argv,
                 cwd.resolve(),
                 env,
                 requested_gpus,
                 name or Path(argv[0]).name,
-                placeholder,
+                group=group,
+                key=key,
             )
-            log_path = self.logs_dir / f"{job.id}.log"
-            self.db.set_log_path(job.id, log_path)
             self.log.info("submitted job %s requesting %s GPU(s): %r", job.id, requested_gpus, argv)
             await self._try_schedule_locked()
             result = self.db.get_job(job.id)
@@ -131,9 +178,16 @@ class Scheduler:
         async with self.lock:
             return self.db.active_jobs()
 
-    async def list_jobs(self, limit: int | None = None) -> list[Job]:
+    async def list_jobs(
+        self,
+        limit: int | None = None,
+        *,
+        group: str | None = None,
+        states: list[JobState] | None = None,
+        id_ranges: list[tuple[int, int]] | None = None,
+    ) -> list[Job]:
         async with self.lock:
-            return self.db.list_jobs(limit)
+            return self.db.list_jobs(limit, group=group, states=states, id_ranges=id_ranges)
 
     async def get_job(self, job_id: int) -> Job | None:
         async with self.lock:
@@ -150,22 +204,196 @@ class Scheduler:
             job = self.db.get_job(job_id)
             if job is None:
                 raise SchedulerError(f"job {job_id} does not exist")
-            if job.state is JobState.WAITING:
-                self.db.finish(job.id, JobState.CANCELLED, reason="cancelled before launch")
-                self.log.info("cancelled waiting job %s", job.id)
-                await self._try_schedule_locked()
-                return "cancelled"
             if job.state.terminal:
                 raise SchedulerError(f"job {job_id} is already {job.state.value}")
-            if job.state is JobState.CANCELLING:
-                return "cancellation already in progress"
-            if not self.db.set_cancelling(job.id):
-                raise SchedulerError(f"job {job_id} cannot be cancelled from {job.state.value}")
-            sent = signal_managed_group(job.pid, job.pgid, job.process_start_time, signal.SIGTERM)
-            self.log.info("cancelling job %s with SIGTERM (sent=%s)", job.id, sent)
-            task = asyncio.create_task(self._finish_cancellation(job.id))
-            self._cancellation_tasks[job.id] = task
-            return "cancellation requested"
+            outcome = self._cancel_locked(job)
+            await self._try_schedule_locked()
+            return outcome
+
+    async def cancel_many(self, job_ids: list[int]) -> dict[str, list[int]]:
+        """Cancel a batch under one lock hold.
+
+        Separate per-job requests would leave gaps in which a running job exits and its
+        GPU is handed to a waiting job that a later request in the batch then kills.
+        """
+        result: dict[str, list[int]] = {"cancelled": [], "cancelling": [], "skipped": []}
+        async with self.lock:
+            for job_id in job_ids:
+                job = self.db.get_job(job_id)
+                if job is None or job.state.terminal:
+                    result["skipped"].append(job_id)
+                    continue
+                outcome = self._cancel_locked(job)
+                result["cancelled" if outcome == "cancelled" else "cancelling"].append(job_id)
+            await self._try_schedule_locked()
+        return result
+
+    def _cancel_locked(self, job: Job) -> str:
+        if job.state is JobState.WAITING:
+            self.db.finish(job.id, JobState.CANCELLED, reason="cancelled before launch")
+            self.log.info("cancelled waiting job %s", job.id)
+            return "cancelled"
+        if job.state is JobState.CANCELLING:
+            return "cancellation already in progress"
+        if not self.db.set_cancelling(job.id):
+            raise SchedulerError(f"job {job.id} cannot be cancelled from {job.state.value}")
+        sent = signal_managed_group(job.pid, job.pgid, job.process_start_time, signal.SIGTERM)
+        self.log.info("cancelling job %s with SIGTERM (sent=%s)", job.id, sent)
+        task = asyncio.create_task(self._finish_cancellation(job.id))
+        self._cancellation_tasks[job.id] = task
+        return "cancellation requested"
+
+    async def retry(self, job_ids: list[int]) -> dict[str, object]:
+        """Resubmit failed or cancelled jobs with their original command and context.
+
+        Only the newest attempt in a retry lineage is retried, so running the same retry
+        twice cannot queue duplicates.
+        """
+        created: list[dict[str, int]] = []
+        skipped: list[dict[str, object]] = []
+        released: list[str] = []
+        async with self.lock:
+            self._refresh_observations_locked()
+            gpu_count = len(self._observations)
+            for job_id in job_ids:
+                job = self.db.get_job(job_id)
+                reason = None
+                if job is None:
+                    reason = "does not exist"
+                elif job.state not in (JobState.FAILED, JobState.CANCELLED):
+                    reason = f"is {job.state.value}; only FAILED and CANCELLED jobs are retried"
+                elif (newer := self.db.newer_attempt(job.retry_of or job.id, job.id)) is not None:
+                    reason = f"was already retried as job {newer}"
+                elif not job.cwd.is_dir():
+                    reason = f"its working directory no longer exists: {job.cwd}"
+                elif job.requested_gpus > gpu_count:
+                    reason = f"needs {job.requested_gpus} GPUs but {gpu_count} are visible"
+                if job is None or reason is not None:
+                    skipped.append({"id": job_id, "reason": reason})
+                    continue
+                try:
+                    attempt = self._create_locked(
+                        job.argv,
+                        job.cwd,
+                        job.env,
+                        job.requested_gpus,
+                        job.name,
+                        group=job.group,
+                        key=job.key,
+                        retry_of=job.retry_of or job.id,
+                    )
+                except DuplicateKey as exc:
+                    skipped.append({"id": job_id, "reason": str(exc)})
+                    continue
+                created.append({"from": job.id, "job_id": attempt.id})
+                self.log.info("retrying job %s as job %s", job.id, attempt.id)
+                # Retrying says the cause was addressed, so a hold on the group would
+                # only stop the retry from running.
+                if job.group in self._held and self._set_hold_locked(job.group, False):
+                    released.append(job.group)
+            await self._try_schedule_locked()
+        return {"created": created, "skipped": skipped, "released_groups": released}
+
+    async def set_group_held(self, group: str, held: bool, reason: str | None = None) -> bool:
+        group = _validate_label(group, "group") or ""
+        async with self.lock:
+            changed = self._set_hold_locked(group, held, reason or MANUAL_HOLD_REASON)
+            if changed and not held:
+                await self._try_schedule_locked()
+            return changed
+
+    async def group_summaries(self) -> list[dict[str, object]]:
+        async with self.lock:
+            counts = self.db.group_counts()
+            retried = self.db.group_retried_counts()
+            names = sorted(set(counts) | set(retried) | set(self._held))
+            return [
+                {
+                    "group": name,
+                    "counts": counts.get(name, {}),
+                    "retried": retried.get(name, 0),
+                    "held": name in self._held,
+                    "hold_reason": self._held.get(name),
+                }
+                for name in names
+            ]
+
+    @property
+    def held_groups(self) -> dict[str, str]:
+        return dict(self._held)
+
+    def _set_hold_locked(self, group: str, held: bool, reason: str | None = None) -> bool:
+        changed = self.db.set_group_hold(group, held, reason if held else None)
+        if held:
+            self._held[group] = reason or ""
+        else:
+            self._held.pop(group, None)
+        if changed:
+            if held:
+                self.log.warning("holding group %s: %s", group, reason)
+            else:
+                self.log.info("released hold on group %s", group)
+        return changed
+
+    def _create_locked(
+        self,
+        argv: list[str],
+        cwd: Path,
+        env: dict[str, str],
+        requested_gpus: int,
+        name: str | None,
+        *,
+        group: str | None,
+        key: str | None,
+        retry_of: int | None = None,
+    ) -> Job:
+        try:
+            job = self.db.create_job(
+                argv,
+                cwd,
+                env,
+                requested_gpus,
+                name,
+                self.logs_dir / "pending.log",
+                group=group,
+                key=key,
+                retry_of=retry_of,
+            )
+        except KeyInUse as exc:
+            existing = self.db.get_job(exc.job_id)
+            assert existing is not None
+            raise DuplicateKey(existing) from exc
+        self.db.set_log_path(job.id, self.logs_dir / f"{job.id}.log")
+        refreshed = self.db.get_job(job.id)
+        assert refreshed is not None
+        return refreshed
+
+    def _note_failure_locked(self, job_id: int) -> None:
+        """Hold a job's group if its recent jobs keep failing right after they start.
+
+        Called only for failures of jobs this daemon launched and watched, never for jobs
+        failed by restart recovery, whose timing says nothing about the command.
+        """
+        if self.fail_fast_count <= 0:
+            return
+        job = self.db.get_job(job_id)
+        if job is None or job.group is None or job.group in self._held:
+            return
+        since = self.db.group_released_at(job.group)
+        recent = self.db.recent_group_outcomes(job.group, since, self.fail_fast_count)
+        if len(recent) < self.fail_fast_count:
+            return
+        if all(
+            item.state is JobState.FAILED and _runtime(item) < self.fail_fast_seconds
+            for item in recent
+        ):
+            ids = ", ".join(str(item.id) for item in sorted(recent, key=lambda j: j.id))
+            self._set_hold_locked(
+                job.group,
+                True,
+                f"{len(recent)} jobs in a row failed within {self.fail_fast_seconds:g}s "
+                f"of starting ({ids})",
+            )
 
     async def delete_jobs(self, job_ids: list[int]) -> list[Job]:
         async with self.lock:
@@ -259,6 +487,10 @@ class Scheduler:
             return
         statuses = self._gpu_status_locked()
         for waiting in self.db.waiting_jobs():
+            # Re-checked for every job: a launch failure earlier in this same pass can
+            # put the group on hold.
+            if waiting.group is not None and waiting.group in self._held:
+                continue
             selected = select_gpus(statuses, waiting.requested_gpus)
             if not selected:
                 continue  # simple backfilling: try younger jobs
@@ -323,10 +555,13 @@ class Scheduler:
                         exit_code=exit_code,
                         reason="could not record Linux process identity after launch",
                     )
+                    self._note_failure_locked(job.id)
                 else:
                     state = JobState.DONE if exit_code == 0 else JobState.FAILED
                     reason = None if exit_code == 0 else f"command exited with status {exit_code}"
                     self.db.finish(job.id, state, exit_code=exit_code, reason=reason)
+                    if state is JobState.FAILED:
+                        self._note_failure_locked(job.id)
                 return
             self.db.mark_running(job.id, process.pid, pgid, started, boot_id())
             self._processes[job.id] = process
@@ -350,6 +585,7 @@ class Scheduler:
                 reason=f"process launch failed: {exc}",
             )
             self.log.exception("failed to launch job %s", job.id)
+            self._note_failure_locked(job.id)
 
     async def _monitor_process(self, job_id: int, process: asyncio.subprocess.Process) -> None:
         try:
@@ -377,6 +613,8 @@ class Scheduler:
                 self.log.info(
                     "job %s finished as %s (exit=%s)", job_id, final_state.value, exit_code
                 )
+                if final_state is JobState.FAILED:
+                    self._note_failure_locked(job_id)
                 self._refresh_observations_locked()
                 await self._try_schedule_locked()
         except asyncio.CancelledError:

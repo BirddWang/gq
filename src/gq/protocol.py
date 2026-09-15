@@ -8,7 +8,9 @@ from typing import Any
 # Bump whenever the request/response contract changes incompatibly. Every request
 # carries it so a daemon left running across an upgrade reports a clear mismatch
 # instead of failing on a missing field.
-PROTOCOL_VERSION = 1
+# Version 2 (gq 0.3.0) added job groups and keys. A version 1 daemon would silently
+# ignore a submission's key and queue duplicates, hence the bump.
+PROTOCOL_VERSION = 2
 
 
 class ProtocolError(RuntimeError):

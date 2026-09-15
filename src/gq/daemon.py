@@ -17,11 +17,58 @@ from .models import JobState
 from .nvml import NVMLProvider
 from .paths import Paths
 from .protocol import PROTOCOL_VERSION
-from .scheduler import Scheduler, SchedulerError
+from .scheduler import DuplicateKey, Scheduler, SchedulerError
 
 
 class AlreadyRunning(RuntimeError):
     pass
+
+
+def _optional_string(request: dict[str, Any], field: str) -> str | None:
+    value = request.get(field)
+    if value is not None and not isinstance(value, str):
+        raise ValueError(f"{field} must be a string")
+    return value
+
+
+def _job_ids(request: dict[str, Any]) -> list[int]:
+    raw = request["job_ids"]
+    if not isinstance(raw, list) or not all(
+        isinstance(v, int) and not isinstance(v, bool) for v in raw
+    ):
+        raise ValueError("job_ids must be a list of integers")
+    return raw
+
+
+def _states(request: dict[str, Any]) -> list[JobState] | None:
+    raw = request.get("states")
+    if raw is None:
+        return None
+    if not isinstance(raw, list):
+        raise ValueError("states must be a list")
+    try:
+        return [JobState(value) for value in raw]
+    except ValueError as exc:
+        raise ValueError(f"unknown job state: {exc}") from exc
+
+
+def _id_ranges(request: dict[str, Any]) -> list[tuple[int, int]] | None:
+    raw = request.get("id_ranges")
+    if raw is None:
+        return None
+    ranges: list[tuple[int, int]] = []
+    if not isinstance(raw, list):
+        raise ValueError("id_ranges must be a list of [low, high] pairs")
+    for pair in raw:
+        if (
+            not isinstance(pair, list)
+            or len(pair) != 2
+            or not all(isinstance(v, int) and not isinstance(v, bool) for v in pair)
+            or pair[0] > pair[1]
+        ):
+            raise ValueError("id_ranges must be a list of [low, high] pairs with low <= high")
+        ranges.append((pair[0], pair[1]))
+    return ranges
 
 
 def in_container() -> bool:
@@ -97,6 +144,8 @@ class Daemon:
             provider,
             self.paths.logs_dir,
             cancel_grace_seconds=float(os.environ.get("GQ_CANCEL_GRACE_SECONDS", "10")),
+            fail_fast_count=int(os.environ.get("GQ_FAIL_FAST_COUNT", "3")),
+            fail_fast_seconds=float(os.environ.get("GQ_FAIL_FAST_SECONDS", "60")),
             logger=self.log,
         )
         await self.scheduler.initialize()
@@ -196,21 +245,39 @@ class Daemon:
                 isinstance(k, str) and isinstance(v, str) for k, v in env.items()
             ):
                 raise ValueError("env must be an object containing strings")
-            job = await self.scheduler.submit(
-                argv,
-                Path(request["cwd"]),
-                env,
-                int(request["requested_gpus"]),
-                request.get("name"),
-            )
-            return {"ok": True, "job_id": job.id, "state": job.state.value}
+            try:
+                job = await self.scheduler.submit(
+                    argv,
+                    Path(request["cwd"]),
+                    env,
+                    int(request["requested_gpus"]),
+                    request.get("name"),
+                    group=_optional_string(request, "group"),
+                    key=_optional_string(request, "key"),
+                )
+            except DuplicateKey as exc:
+                # Not an error: re-running a sweep script is supposed to skip done cells.
+                return {
+                    "ok": True,
+                    "skipped": True,
+                    "job_id": exc.existing.id,
+                    "state": exc.existing.state.value,
+                    "message": str(exc),
+                }
+            return {"ok": True, "skipped": False, "job_id": job.id, "state": job.state.value}
         if kind == "list_jobs":
             limit = request.get("limit")
-            jobs = await self.scheduler.list_jobs(int(limit) if limit is not None else None)
+            jobs = await self.scheduler.list_jobs(
+                int(limit) if limit is not None else None,
+                group=_optional_string(request, "group"),
+                states=_states(request),
+                id_ranges=_id_ranges(request),
+            )
             return {
                 "ok": True,
                 "jobs": [job.to_dict() for job in jobs],
                 "queue_paused": self.scheduler.paused,
+                "held_groups": self.scheduler.held_groups,
             }
         if kind == "show_job":
             shown = await self.scheduler.get_job(int(request["job_id"]))
@@ -230,24 +297,29 @@ class Daemon:
             removed = await self.scheduler.delete_jobs([int(v) for v in raw_ids])
             return {"ok": True, "removed": [job.id for job in removed]}
         if kind == "clean_jobs":
-            raw_states = request.get("states")
-            states: list[JobState] | None = None
-            if raw_states is not None:
-                if not isinstance(raw_states, list):
-                    raise ValueError("states must be a list")
-                try:
-                    states = [JobState(value) for value in raw_states]
-                except ValueError as exc:
-                    raise ValueError(f"unknown job state: {exc}") from exc
-            removed = await self.scheduler.clean_jobs(str(request["cutoff"]), states)
+            removed = await self.scheduler.clean_jobs(str(request["cutoff"]), _states(request))
             return {"ok": True, "removed": [job.id for job in removed]}
         if kind == "pause_queue":
+            group = _optional_string(request, "group")
+            if group is not None:
+                changed = await self.scheduler.set_group_held(group, True)
+                return {"ok": True, "changed": changed}
             await self.scheduler.set_paused(True)
             active = await self.scheduler.active_jobs()
             return {"ok": True, "active_job_ids": [job.id for job in active]}
         if kind == "resume_queue":
+            group = _optional_string(request, "group")
+            if group is not None:
+                changed = await self.scheduler.set_group_held(group, False)
+                return {"ok": True, "changed": changed}
             await self.scheduler.set_paused(False)
             return {"ok": True}
+        if kind == "cancel_jobs":
+            return {"ok": True, **(await self.scheduler.cancel_many(_job_ids(request)))}
+        if kind == "retry_jobs":
+            return {"ok": True, **(await self.scheduler.retry(_job_ids(request)))}
+        if kind == "list_groups":
+            return {"ok": True, "groups": await self.scheduler.group_summaries()}
         if kind == "shutdown":
             self.stop_event.set()
             return {"ok": True, "message": "daemon stopping; running jobs are unchanged"}

@@ -8,14 +8,15 @@ import shlex
 import subprocess
 import sys
 import time
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 from . import __version__
 from . import update as updater
-from .models import JobState
+from .models import MANUAL_HOLD_REASON, JobState
 from .paths import Paths
 from .protocol import PROTOCOL_VERSION, ProtocolError, request
 
@@ -130,9 +131,14 @@ def _submit(
     *,
     env_all: bool = False,
     env_keep: Iterable[str] = (),
+    group: str | None = None,
+    key: str | None = None,
 ) -> None:
     if not argv:
         raise CLIError("a command is required")
+    if group is None:
+        # Lets a sweep script set its group once instead of on every submission.
+        group = os.environ.get("GQ_GROUP") or None
     if argv[0] == "--":
         argv = argv[1:]
     if not argv:
@@ -161,21 +167,34 @@ def _submit(
             "env": env,
             "requested_gpus": gpus,
             "name": name,
+            "group": group,
+            "key": key,
         }
     )
+    if response.get("skipped"):
+        print(f"Skipped: {response['message']}")
+        return
     print(f"Submitted job {response['job_id']}")
 
 
-DIRECTIVE_RE = re.compile(r"^\s*#gq\s+(--(?:gpus|name))=(.*)\s*$")
+DIRECTIVE_RE = re.compile(r"^\s*#gq\s+(--(?:gpus|name|group|key))=(.*)\s*$")
 
 
-def _script_directives(path: Path) -> tuple[int | None, str | None]:
+@dataclass(frozen=True)
+class ScriptDirectives:
+    gpus: int | None = None
+    name: str | None = None
+    group: str | None = None
+    key: str | None = None
+
+
+def _script_directives(path: Path) -> ScriptDirectives:
     try:
         text = path.read_text()
     except (OSError, UnicodeError) as exc:
         raise CLIError(f"cannot read script {path}: {exc}") from exc
     gpus: int | None = None
-    name: str | None = None
+    labels: dict[str, str] = {}
     for line_number, line in enumerate(text.splitlines(), 1):
         stripped = line.strip()
         if not stripped.startswith("#gq"):
@@ -192,9 +211,9 @@ def _script_directives(path: Path) -> tuple[int | None, str | None]:
                 raise CLIError(f"invalid GPU count on line {line_number}: {value!r}") from exc
         else:
             if not value:
-                raise CLIError(f"empty job name on line {line_number}")
-            name = value
-    return gpus, name
+                raise CLIError(f"empty {option[2:]} on line {line_number}")
+            labels[option[2:]] = value
+    return ScriptDirectives(gpus, labels.get("name"), labels.get("group"), labels.get("key"))
 
 
 def _table(headers: list[str], rows: Iterable[Iterable[Any]]) -> str:
@@ -215,27 +234,247 @@ def _command_text(argv: list[str], maximum: int = 70) -> str:
     return value if len(value) <= maximum else value[: maximum - 1] + "…"
 
 
-def _print_jobs(limit: int | None, as_json: bool = False) -> None:
-    response = _daemon_request({"type": "list_jobs", "limit": limit})
+_ID_RE = re.compile(r"^(\d+)(?:-(\d+))?$")
+
+
+def _parse_selectors(tokens: Sequence[str]) -> list[tuple[int, int]]:
+    """Turn `12` and `300-440` into inclusive id ranges."""
+    ranges: list[tuple[int, int]] = []
+    for token in tokens:
+        match = _ID_RE.match(token.strip())
+        if not match:
+            raise CLIError(f"invalid job id or range {token!r}; use a number like 12 or 300-440")
+        low = int(match.group(1))
+        high = int(match.group(2) or low)
+        if low > high:
+            raise CLIError(f"invalid range {token!r}: the first id must not exceed the second")
+        ranges.append((low, high))
+    return ranges
+
+
+def _list_request(
+    tokens: Sequence[str] = (),
+    group: str | None = None,
+    states: Sequence[str] | None = None,
+    limit: int | None = None,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {"type": "list_jobs", "limit": limit}
+    if tokens:
+        payload["id_ranges"] = [list(pair) for pair in _parse_selectors(tokens)]
+    if group is not None:
+        payload["group"] = group
+    if states:
+        payload["states"] = list(states)
+    return _daemon_request(payload)
+
+
+def _truncate(value: str, maximum: int) -> str:
+    return value if len(value) <= maximum else value[: maximum - 1] + "…"
+
+
+def _notice(message: str) -> None:
+    # Flush the table first so a notice never lands above it when output is captured.
+    sys.stdout.flush()
+    print(message, file=sys.stderr)
+
+
+def _print_holds(held: dict[str, str], groups: Iterable[str]) -> None:
+    for group in sorted(set(groups) & set(held)):
+        if held[group] == MANUAL_HOLD_REASON:
+            hint = f"release it with 'gq daemon resume --group {group}'"
+        else:
+            hint = (
+                f"fix the cause, then 'gq retry --group {group} --failed', or release it "
+                f"as is with 'gq daemon resume --group {group}'"
+            )
+        _notice(f"gq: group {group} is held: {held[group]}\n    {hint}")
+
+
+def _print_jobs(
+    limit: int | None,
+    as_json: bool = False,
+    *,
+    tokens: Sequence[str] = (),
+    group: str | None = None,
+    states: Sequence[str] | None = None,
+) -> None:
+    response = _list_request(tokens, group, states, limit)
     if as_json:
         print(json.dumps(response["jobs"], indent=2))
         return
+    jobs = response["jobs"]
+    held: dict[str, str] = response.get("held_groups") or {}
+    show_group = any(job.get("group") for job in jobs)
     rows = []
-    for job in response["jobs"]:
+    displayed: dict[int, str] = {}
+    for job in jobs:
         gpus = ",".join(map(str, job["gpu_indices"])) or "-"
-        rows.append(
-            (
-                job["id"],
-                job["state"],
-                gpus,
-                job["pid"] or "-",
-                job["name"] or "-",
-                _command_text(job["argv"]),
-            )
-        )
-    print(_table(["JOB", "STATE", "GPUs", "PID", "NAME", "COMMAND"], rows))
+        state = job["state"]
+        if state == JobState.WAITING.value and job.get("group") in held:
+            state = "HELD"  # display only: the stored state is still WAITING
+        displayed[job["id"]] = state
+        row = [job["id"], state, gpus, job["pid"] or "-"]
+        if show_group:
+            row.append(_truncate(job.get("group") or "-", 24))
+        row += [job["name"] or "-", _command_text(job["argv"])]
+        rows.append(row)
+    headers = ["JOB", "STATE", "GPUs", "PID"] + (["GROUP"] if show_group else [])
+    print(_table([*headers, "NAME", "COMMAND"], rows))
+    if group is not None and not tokens and not states and limit is None:
+        superseded = _superseded_ids(jobs)
+        counts: dict[str, int] = {}
+        for job in jobs:
+            if job["id"] not in superseded:
+                counts[displayed[job["id"]]] = counts.get(displayed[job["id"]], 0) + 1
+        summary = ", ".join(f"{n} {state}" for state, n in sorted(counts.items())) or "no jobs"
+        if superseded:
+            summary += f" (plus {len(superseded)} earlier attempts, since retried)"
+        print(f"{group}: {summary}")
+    shown_groups = {job["group"] for job in jobs if job.get("group")}
+    if group is not None:
+        shown_groups.add(group)  # a held group may have nothing left to list
+    _print_holds(held, shown_groups)
     if response.get("queue_paused"):
-        print("gq: the queue is paused; resume it with 'gq daemon resume'", file=sys.stderr)
+        _notice("gq: the queue is paused; resume it with 'gq daemon resume'")
+
+
+def _superseded_ids(jobs: Sequence[dict[str, Any]]) -> set[int]:
+    """Ids of attempts that a later retry in the same lineage replaced."""
+    latest: dict[int, int] = {}
+    for job in jobs:
+        root = job.get("retry_of") or job["id"]
+        latest[root] = max(latest.get(root, 0), job["id"])
+    return {job["id"] for job in jobs if latest[job.get("retry_of") or job["id"]] != job["id"]}
+
+
+def _print_groups(as_json: bool) -> None:
+    groups = _daemon_request({"type": "list_groups"})["groups"]
+    if as_json:
+        print(json.dumps(groups, indent=2))
+        return
+    if not groups:
+        print("No groups yet. Submit with --group NAME, or set GQ_GROUP in a sweep script.")
+        return
+    active = (JobState.STARTING.value, JobState.RUNNING.value, JobState.CANCELLING.value)
+    show_orphaned = any(g["counts"].get(JobState.ORPHANED.value) for g in groups)
+    show_retried = any(g.get("retried") for g in groups)
+    rows = []
+    for entry in groups:
+        counts = entry["counts"]
+        row = [
+            _truncate(entry["group"], 32),
+            counts.get(JobState.WAITING.value, 0),
+            sum(counts.get(state, 0) for state in active),
+            counts.get(JobState.DONE.value, 0),
+            counts.get(JobState.FAILED.value, 0),
+            counts.get(JobState.CANCELLED.value, 0),
+        ]
+        if show_orphaned:
+            row.append(counts.get(JobState.ORPHANED.value, 0))
+        if show_retried:
+            row.append(entry.get("retried", 0))
+        row.append("held" if entry["held"] else "-")
+        rows.append(row)
+    headers = ["GROUP", "WAITING", "RUNNING", "DONE", "FAILED", "CANCELLED"]
+    headers += ["ORPHANED"] if show_orphaned else []
+    headers += ["RETRIED"] if show_retried else []
+    print(_table([*headers, "STATUS"], rows))
+    _print_holds(
+        {entry["group"]: entry["hold_reason"] for entry in groups if entry["held"]},
+        (entry["group"] for entry in groups),
+    )
+    if show_retried:
+        _notice("counts cover each job's latest attempt; RETRIED is how many were replaced")
+
+
+def _confirm(question: str, assume_yes: bool, flag: str = "--yes") -> bool:
+    if assume_yes:
+        return True
+    if not sys.stdin.isatty():
+        raise CLIError(f"this needs a terminal to confirm; pass {flag} to run it non-interactively")
+    return input(f"{question} [y/N] ").strip().lower() in {"y", "yes"}
+
+
+def _plural(count: int, noun: str) -> str:
+    return f"{count} {noun}" if count == 1 else f"{count} {noun}s"
+
+
+def _cancel(
+    tokens: Sequence[str],
+    group: str | None,
+    states: Sequence[str] | None,
+    assume_yes: bool,
+) -> None:
+    if len(tokens) == 1 and tokens[0].isdigit() and group is None and not states:
+        # One plain id keeps its original, stricter behavior: cancelling a job that
+        # already finished is reported as an error rather than silently skipped.
+        response = _daemon_request({"type": "cancel_job", "job_id": int(tokens[0])})
+        print(f"Job {tokens[0]}: {response['message']}")
+        return
+    if not tokens and group is None and not states:
+        raise CLIError("say what to cancel: job ids or ranges (12 300-440), --group, or --waiting")
+    wanted = states or [JobState.WAITING.value, JobState.STARTING.value, JobState.RUNNING.value]
+    jobs = _list_request(tokens, group, wanted)["jobs"]
+    if not jobs:
+        print("No matching jobs to cancel.")
+        return
+    running = [job["id"] for job in jobs if job["state"] != JobState.WAITING.value]
+    waiting = len(jobs) - len(running)
+    if running and len(jobs) > 1:
+        question = (
+            f"Cancel {_plural(len(jobs), 'job')} "
+            f"({len(running)} running, {waiting} waiting)? Running jobs will be killed."
+        )
+        if not _confirm(question, assume_yes):
+            print("Nothing was cancelled.")
+            return
+    # Cancel exactly what was listed (and confirmed), not whatever matches by now.
+    ids = sorted(job["id"] for job in jobs)
+    result = _daemon_request({"type": "cancel_jobs", "job_ids": ids}, timeout=30.0)
+    parts = []
+    if result["cancelled"]:
+        parts.append(f"cancelled {_plural(len(result['cancelled']), 'waiting job')}")
+    if result["cancelling"]:
+        parts.append(f"stopping {_plural(len(result['cancelling']), 'running job')}")
+    if result["skipped"]:
+        parts.append(f"{len(result['skipped'])} had already finished")
+    print((", ".join(parts) or "nothing to do").capitalize() + ".")
+
+
+def _retry(tokens: Sequence[str], group: str | None, states: Sequence[str] | None) -> None:
+    if not tokens and group is None:
+        raise CLIError("say what to retry: job ids or ranges (216-218), or --group NAME")
+    if tokens and not states:
+        # Without a state filter, every matching job is sent so the daemon can say why
+        # a DONE or RUNNING one was not retried, instead of it silently vanishing.
+        found = {job["id"] for job in _list_request(tokens, group)["jobs"]}
+        ids = sorted(found)
+        if group is None:
+            # A plain id that matched nothing is sent too, to be reported as missing.
+            # Ranges are exempt: gaps in a range are normal after `gq rm`.
+            named = {int(token) for token in tokens if token.strip().isdigit()}
+            ids = sorted(found | named)
+    else:
+        wanted = states or [JobState.FAILED.value, JobState.CANCELLED.value]
+        ids = sorted(job["id"] for job in _list_request(tokens, group, wanted)["jobs"])
+    if not ids:
+        print("No failed or cancelled jobs match.")
+        return
+    result = _daemon_request({"type": "retry_jobs", "job_ids": ids}, timeout=30.0)
+    created = result["created"]
+    if created:
+        pairs = [f"{item['from']}->{item['job_id']}" for item in created]
+        shown = ", ".join(pairs[:12]) + (f", and {len(pairs) - 12} more" if len(pairs) > 12 else "")
+        print(f"Retried {_plural(len(created), 'job')}: {shown}")
+    for group_name in result["released_groups"]:
+        print(f"Released the hold on group {group_name}.")
+    skipped = result["skipped"]
+    if skipped:
+        print(f"Skipped {_plural(len(skipped), 'job')}:")
+        for item in skipped[:12]:
+            print(f"  {item['id']}: {item['reason']}")
+        if len(skipped) > 12:
+            print(f"  ... and {len(skipped) - 12} more")
 
 
 def _mib(value: int | None) -> str:
@@ -573,10 +812,27 @@ def _add_env_options(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _add_label_options(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--group",
+        metavar="NAME",
+        help="tag the job with a group, for bulk actions (default: $GQ_GROUP)",
+    )
+    parser.add_argument(
+        "--key",
+        metavar="KEY",
+        help="skip the submission if a waiting, running, or DONE job already has this key",
+    )
+
+
+ALL_STATES = [state.value for state in JobState]
+
+
 def _run_parser(prog: str) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog=prog, description="submit a GPU job")
     parser.add_argument("-g", "--gpus", type=int, required=True, help="number of GPUs")
     parser.add_argument("--name", help="job name")
+    _add_label_options(parser)
     _add_env_options(parser)
     parser.add_argument("command", nargs=argparse.REMAINDER)
     return parser
@@ -590,6 +846,7 @@ def _main_parser() -> argparse.ArgumentParser:
     run = sub.add_parser("run", help="submit a command")
     run.add_argument("-g", "--gpus", type=int, required=True)
     run.add_argument("--name")
+    _add_label_options(run)
     _add_env_options(run)
     run.add_argument("command", nargs=argparse.REMAINDER)
 
@@ -597,11 +854,20 @@ def _main_parser() -> argparse.ArgumentParser:
     submit.add_argument("script", type=Path)
     submit.add_argument("-g", "--gpus", type=int)
     submit.add_argument("--name")
+    _add_label_options(submit)
     _add_env_options(submit)
 
     ps = sub.add_parser("ps", help="list jobs")
+    ps.add_argument("jobs", nargs="*", metavar="JOB", help="job ids or ranges such as 300-440")
+    ps.add_argument("--group", metavar="NAME", help="only jobs in this group")
+    ps.add_argument(
+        "--state", action="append", choices=ALL_STATES, help="only jobs in this state (repeatable)"
+    )
     ps.add_argument("--limit", type=int)
     ps.add_argument("--json", action="store_true", help="emit JSON instead of a table")
+
+    groups = sub.add_parser("groups", help="list job groups and their progress")
+    groups.add_argument("--json", action="store_true", help="emit JSON instead of a table")
     gpu = sub.add_parser("gpu", help="show physical and logical GPU state")
     gpu.add_argument("--json", action="store_true", help="emit JSON instead of a table")
 
@@ -631,8 +897,29 @@ def _main_parser() -> argparse.ArgumentParser:
     logs.add_argument("-f", "--follow", action="store_true")
     logs.add_argument("job_id", type=int)
 
-    cancel = sub.add_parser("cancel", help="cancel a job")
-    cancel.add_argument("job_id", type=int)
+    cancel = sub.add_parser("cancel", help="cancel jobs")
+    cancel.add_argument("jobs", nargs="*", metavar="JOB", help="job ids or ranges such as 300-440")
+    cancel.add_argument("--group", metavar="NAME", help="jobs in this group")
+    cancel_which = cancel.add_mutually_exclusive_group()
+    cancel_which.add_argument(
+        "--waiting", action="store_true", help="only jobs that have not started"
+    )
+    cancel_which.add_argument(
+        "--state",
+        action="append",
+        choices=[JobState.WAITING.value, JobState.STARTING.value, JobState.RUNNING.value],
+        help="only jobs in this state (repeatable)",
+    )
+    cancel.add_argument(
+        "-y", "--yes", action="store_true", help="do not ask before killing running jobs"
+    )
+
+    retry = sub.add_parser("retry", help="resubmit failed or cancelled jobs")
+    retry.add_argument("jobs", nargs="*", metavar="JOB", help="job ids or ranges such as 216-218")
+    retry.add_argument("--group", metavar="NAME", help="jobs in this group")
+    retry_which = retry.add_mutually_exclusive_group()
+    retry_which.add_argument("--failed", action="store_true", help="only FAILED jobs")
+    retry_which.add_argument("--cancelled", action="store_true", help="only CANCELLED jobs")
 
     update = sub.add_parser("update", help="upgrade gq to the latest release")
     update.add_argument(
@@ -656,10 +943,27 @@ def _main_parser() -> argparse.ArgumentParser:
         choices=("start", "stop", "status", "pause", "resume"),
         help="pause stops queued jobs from starting; running jobs are unaffected",
     )
+    daemon.add_argument(
+        "--group", metavar="NAME", help="with pause or resume: hold or release only this group"
+    )
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
+    try:
+        code = _main(argv)
+        sys.stdout.flush()
+        return code
+    except BrokenPipeError:
+        # The reader went away (`gq ps | head`). Point stdout at /dev/null so the
+        # interpreter's final flush cannot print a second error, and exit the way a
+        # process killed by SIGPIPE would.
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(devnull, sys.stdout.fileno())
+        return 141
+
+
+def _main(argv: list[str] | None) -> int:
     arguments = list(sys.argv[1:] if argv is None else argv)
     try:
         if arguments and (
@@ -674,6 +978,8 @@ def main(argv: list[str] | None = None) -> int:
                 args.name,
                 env_all=args.env_all,
                 env_keep=args.env_keep,
+                group=args.group,
+                key=args.key,
             )
             return 0
 
@@ -685,21 +991,29 @@ def main(argv: list[str] | None = None) -> int:
                 args.name,
                 env_all=args.env_all,
                 env_keep=args.env_keep,
+                group=args.group,
+                key=args.key,
             )
         elif args.subcommand == "submit":
             script = args.script.expanduser().resolve()
             if not script.is_file():
                 raise CLIError(f"script does not exist or is not a regular file: {script}")
-            directive_gpus, directive_name = _script_directives(script)
+            directives = _script_directives(script)
             _submit(
                 ["/bin/bash", str(script)],
-                args.gpus if args.gpus is not None else directive_gpus or 1,
-                args.name if args.name is not None else directive_name,
+                args.gpus if args.gpus is not None else directives.gpus or 1,
+                args.name if args.name is not None else directives.name,
                 env_all=args.env_all,
                 env_keep=args.env_keep,
+                group=args.group if args.group is not None else directives.group,
+                key=args.key if args.key is not None else directives.key,
             )
         elif args.subcommand == "ps":
-            _print_jobs(args.limit, args.json)
+            _print_jobs(
+                args.limit, args.json, tokens=args.jobs, group=args.group, states=args.state
+            )
+        elif args.subcommand == "groups":
+            _print_groups(args.json)
         elif args.subcommand == "gpu":
             _print_gpus(args.json)
         elif args.subcommand == "show":
@@ -711,8 +1025,17 @@ def main(argv: list[str] | None = None) -> int:
         elif args.subcommand == "logs":
             _logs(args.job_id, args.follow)
         elif args.subcommand == "cancel":
-            response = _daemon_request({"type": "cancel_job", "job_id": args.job_id})
-            print(f"Job {args.job_id}: {response['message']}")
+            states = [JobState.WAITING.value] if args.waiting else args.state
+            _cancel(args.jobs, args.group, states, args.yes)
+        elif args.subcommand == "retry":
+            states = (
+                [JobState.FAILED.value]
+                if args.failed
+                else [JobState.CANCELLED.value]
+                if args.cancelled
+                else None
+            )
+            _retry(args.jobs, args.group, states)
         elif args.subcommand == "update":
             return _update(args.check, args.wait, args.force)
         elif args.subcommand == "daemon":
@@ -721,6 +1044,22 @@ def main(argv: list[str] | None = None) -> int:
                 _start_daemon(paths)
             elif args.action == "stop":
                 _stop_daemon(paths)
+            elif args.group is not None and args.action in ("pause", "resume"):
+                response = _daemon_request({"type": f"{args.action}_queue", "group": args.group})
+                if args.action == "pause":
+                    print(
+                        f"Group {args.group} is held; its queued jobs will not start."
+                        if response["changed"]
+                        else f"Group {args.group} was already held."
+                    )
+                else:
+                    print(
+                        f"Released the hold on group {args.group}."
+                        if response["changed"]
+                        else f"Group {args.group} was not held."
+                    )
+            elif args.group is not None:
+                raise CLIError("--group only applies to 'gq daemon pause' and 'gq daemon resume'")
             elif args.action == "pause":
                 response = _daemon_request({"type": "pause_queue"})
                 active = response["active_job_ids"]

@@ -89,6 +89,12 @@ Only `FREE` GPUs count. A request may wait behind running work, an external CUDA
 context, or an NVML failure. Smaller younger jobs may backfill; the MVP has no
 starvation reservation for large jobs.
 
+If `gq ps` shows the job as `HELD`, its group is on hold, either because its recent
+jobs kept failing right after starting or because someone paused it. `gq groups` shows
+why. Fix the cause and `gq retry --group NAME --failed`, or release it unchanged with
+`gq daemon resume --group NAME`. If `gq ps` says the whole queue is paused, run
+`gq daemon resume`.
+
 ## A job failed to launch
 
 `gq show JOB` reports failures such as a missing executable, permission error, or

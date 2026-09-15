@@ -63,6 +63,15 @@ Waiting jobs are visited oldest first. If one cannot fit, the pass continues to
 younger jobs. This is useful workstation backfilling, without MVP priority or
 anti-starvation machinery.
 
+Jobs in a held group are skipped. The set of held groups lives in the `group_holds`
+table and is mirrored in memory, and the pass consults it before *every* launch, not
+once per pass: a launch failure is recorded synchronously inside the pass, and can
+itself be the failure that puts the group on hold. Only a failure of a job this
+daemon launched and watched can trigger a hold; restart recovery never does.
+
+Key uniqueness is enforced where the job row is inserted, inside the same `BEGIN
+IMMEDIATE` transaction, rather than by a check before it.
+
 ## Process lifecycle
 
 Jobs use direct argv execution with `start_new_session=True`; the new session's

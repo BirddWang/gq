@@ -5,6 +5,10 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
+# The reason recorded when someone holds a group by hand rather than gq holding it
+# because its jobs keep failing.
+MANUAL_HOLD_REASON = "paused by user"
+
 
 class JobState(str, Enum):
     WAITING = "WAITING"
@@ -101,6 +105,10 @@ class Job:
     failure_reason: str | None = None
     gpu_uuids: list[str] = field(default_factory=list)
     gpu_indices: list[int] = field(default_factory=list)
+    group: str | None = None
+    key: str | None = None
+    # The first job in this job's retry lineage, so every attempt shares one root.
+    retry_of: int | None = None
 
     def to_dict(self, *, include_env: bool = False) -> dict[str, Any]:
         result: dict[str, Any] = {
@@ -122,6 +130,9 @@ class Job:
             "failure_reason": self.failure_reason,
             "gpu_uuids": self.gpu_uuids,
             "gpu_indices": self.gpu_indices,
+            "group": self.group,
+            "key": self.key,
+            "retry_of": self.retry_of,
         }
         if include_env:
             result["env"] = self.env

@@ -26,6 +26,8 @@ Runtime paths follow XDG conventions:
 For isolated tests, `GQ_DATA_DIR`, `GQ_RUNTIME_DIR`, and `GQ_DATABASE` override
 those paths. `GQ_RECONCILE_INTERVAL` and `GQ_CANCEL_GRACE_SECONDS` override the
 2-second scan interval and 10-second cancellation grace period.
+`GQ_FAIL_FAST_COUNT` (default 3, `0` disables) and `GQ_FAIL_FAST_SECONDS` (default
+60) control when a failing group is held; see [Held groups](#held-groups).
 
 ## Submitting commands
 
@@ -100,6 +102,8 @@ they were submitted. These directives are supported:
 ```bash
 #gq --gpus=2
 #gq --name=pythia-410m
+#gq --group=layer-depth
+#gq --key=layer-depth/bart/seed1
 ```
 
 CLI options override directives. With no GPU directive or CLI option, a script
@@ -195,6 +199,141 @@ rows and its log file. Log removal is confined to the managed log directory, so 
 hand-edited `log_path` cannot turn cleanup into arbitrary file deletion.
 
 Neither command is reversible. Back up `gq.sqlite3` first if the history matters.
+
+## Sweeps: groups, keys, and retries
+
+A sweep is usually a script that submits dozens of near-identical jobs. Three things
+make those manageable: a **group** names the batch, a **key** names each cell, and
+**retry** reruns what failed.
+
+```bash
+#!/bin/bash
+export GQ_GROUP=xsum-ablation          # every submission below joins this group
+for SEED in 1 2 3; do
+  for CELL in kl kl-enc_hddn kl-enc_self; do
+    gq -g 1 --key "xsum/$CELL/seed$SEED" uv run trainer.py --losses ... --seed "$SEED"
+  done
+done
+```
+
+### Groups
+
+`--group NAME` (or `GQ_GROUP`, or `#gq --group=NAME` in a script) tags a job. A group
+has no setup and no cost; it exists as soon as a job uses it.
+
+```bash
+gq groups                        # every group, with its progress
+gq ps --group xsum-ablation      # its jobs, plus a one-line summary
+```
+
+`gq groups` counts **each cell's latest attempt**: a job that failed and then
+succeeded on retry counts once, as `DONE`. A `RETRIED` column shows how many earlier
+attempts were replaced.
+
+### Keys make a sweep script safe to re-run
+
+`--key KEY` (or `#gq --key=KEY`) names a job's cell. A submission is **skipped** when
+another job with the same key is `WAITING`, `STARTING`, `RUNNING`, `CANCELLING`,
+`ORPHANED`, or `DONE`:
+
+```text
+Skipped: key 'xsum/kl/seed1' is already DONE as job 212
+```
+
+A `FAILED` or `CANCELLED` job frees its key. So re-running a sweep script after a
+crash, a cancellation, or a partial run submits exactly the cells that are missing or
+broken, and skipping exits successfully. The check and the insert happen in one
+transaction, so two scripts racing on the same key cannot both submit it.
+
+The daemon decides "done" from the recorded exit status, which catches a run that was
+killed half-way. That is not the same as your program having written its output. If
+a cell can exit 0 without producing a checkpoint, keep a file check in the script too.
+
+Keys are free-form up to 200 characters; `dataset/cell/seed` reads well. Deleting a
+job with `gq rm` frees its key.
+
+### Selecting many jobs
+
+`gq ps`, `gq cancel`, and `gq retry` accept job ids and inclusive ranges, combined
+with `--group` and a state filter:
+
+```bash
+gq ps 300-440
+gq ps --group xsum-ablation --state FAILED
+gq cancel 300-440 --waiting
+gq cancel --group xsum-ablation          # asks first if it would kill running jobs
+gq cancel --group xsum-ablation -y       # ... or not
+```
+
+A bulk cancel lists what matches, asks for confirmation if any of those jobs are
+running, then cancels exactly the jobs it listed, so a job that joins the group while
+you read the prompt is not swept up. Without a terminal it requires `-y`. The whole
+batch is cancelled in a single step inside the daemon, so a GPU freed by one of the
+jobs cannot be handed to another job in the same batch in the meantime.
+
+`gq cancel JOB` with a single id behaves exactly as before, including reporting an
+error for a job that already finished.
+
+### Retrying
+
+```bash
+gq retry 216-218
+gq retry --group xsum-ablation --failed
+```
+
+Retry resubmits a `FAILED` or `CANCELLED` job as a new job with the same command,
+working directory, stored environment, GPU count, name, group, and key. `--failed` or
+`--cancelled` narrows the selection. Jobs named explicitly by id that cannot be
+retried are listed with the reason, instead of silently skipped.
+
+Attempts form a lineage: `gq show --json` reports `retry_of`, the first job of the
+chain. Only the newest attempt of a lineage is ever retried, so running the same
+`gq retry` twice queues nothing the second time:
+
+```text
+Skipped 3 jobs:
+  216: was already retried as job 482
+```
+
+The stored environment is the one captured at the original submission, with the same
+secret filtering. Retry is for rerunning a command after fixing the code or data it
+uses. If the command itself was wrong, submit a new one.
+
+### Held groups
+
+When a batch has a bug, every job in it tends to fail the same way within seconds.
+Rather than let the whole queue churn through that, gq **holds** a group once its
+3 most recent finished jobs all failed within 60 seconds of starting. A held group's
+queued jobs stay `WAITING`, shown as `HELD` in `gq ps`, and its running jobs are left
+alone:
+
+```text
+gq: group xsum-ablation is held: 3 jobs in a row failed within 60s of starting (7, 8, 9)
+    fix the cause, then 'gq retry --group xsum-ablation --failed', or release it as is
+    with 'gq daemon resume --group xsum-ablation'
+```
+
+The rule is deliberately narrow:
+
+- only grouped jobs are ever held;
+- a `DONE` breaks the streak, and a cancellation neither counts nor breaks it;
+- only a failure of a job gq launched and watched can trigger a hold; failures that
+  restart recovery records never do;
+- a mistyped executable fails inside the scheduling pass itself, so the hold is
+  re-checked before every launch, and a broken group of 143 jobs stops at 3;
+- after a group is released, only failures from then on count;
+- holds are stored in the database and survive a daemon restart or `gq update`.
+
+`gq retry` releases the hold on the group of anything it resubmits, since retrying says
+the cause was dealt with. Tune the rule with `GQ_FAIL_FAST_COUNT` (`0` disables it) and
+`GQ_FAIL_FAST_SECONDS`, set in the daemon's environment.
+
+You can hold a group by hand too, for example while you look into something:
+
+```bash
+gq daemon pause --group xsum-ablation
+gq daemon resume --group xsum-ablation
+```
 
 ## Pausing the queue
 

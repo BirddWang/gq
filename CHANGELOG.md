@@ -3,6 +3,50 @@
 All notable changes to this project are documented here. This project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-09-15
+
+Built around how sweeps actually get run: hundreds of near-identical jobs from a
+script, often re-run, sometimes broken.
+
+### Added
+
+- **Job groups.** `--group NAME`, `GQ_GROUP`, or `#gq --group=` tags a job. `gq groups`
+  shows every group's progress, counting each cell's latest attempt, and `gq ps
+  --group` lists one.
+- **Job keys.** `--key KEY` or `#gq --key=` skips a submission while another job with
+  that key is waiting, running, or done. A failed or cancelled attempt frees the key,
+  so a sweep script can be re-run to fill in only what is missing.
+- **Bulk selection.** `gq ps`, `gq cancel`, and `gq retry` take job ids, inclusive
+  ranges such as `300-440`, `--group`, and state filters. A bulk cancel confirms
+  before killing running jobs and cancels exactly the jobs it listed, in one step
+  inside the daemon.
+- **`gq retry`** resubmits failed or cancelled jobs with their original command,
+  directory, environment, group, and key. Only the newest attempt of each lineage is
+  retried, so repeating a retry never queues duplicates.
+- **Held groups.** A group whose 3 most recent finished jobs all failed within 60
+  seconds of starting is held, so a broken batch stops after 3 failures instead of
+  running every cell. Holds survive restarts. `gq retry` releases the hold on what it
+  resubmits; `gq daemon pause|resume --group` holds and releases by hand.
+  `GQ_FAIL_FAST_COUNT` and `GQ_FAIL_FAST_SECONDS` tune it.
+
+### Changed
+
+- **Protocol version 2.** A version 1 daemon would silently ignore a submission's key
+  and queue duplicates, so gq 0.3.0 refuses to talk to an older daemon. `gq update`
+  handles the restart; otherwise run `gq daemon stop` once after upgrading.
+- **Schema version 2.** The database gains group, key, and retry-lineage columns and
+  a `group_holds` table. Existing jobs are migrated in place. Once a 0.3.0 daemon has
+  opened the database, older versions of gq refuse to use it.
+- `gq ps` shows a `GROUP` column when any listed job has one, and shows queued jobs of
+  a held group as `HELD`. JSON output is unchanged apart from the new `group`, `key`,
+  and `retry_of` fields.
+- `gq cancel` accepts several jobs. A single job id behaves exactly as before.
+
+### Fixed
+
+- Piping gq into a command that stops reading early (`gq ps | head`) no longer prints
+  a `BrokenPipeError` from the CLI. 0.1.1 fixed the daemon side of the same problem.
+
 ## [0.2.0] - 2026-09-15
 
 ### Added
